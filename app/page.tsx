@@ -5,8 +5,6 @@ import { useState, useEffect, useRef } from "react";
 // API Endpoint configured via .env
 const API_ENDPOINT = process.env.API_KEY || "";
 
-// Configurable limit: Exactly 5 user messages + 5 corresponding AI responses (10 chat messages total)
-const MAX_CONVERSATION_MESSAGES = 5;
 
 // Reusable configuration for 503 retry logic
 const MAX_503_RETRIES = 2;
@@ -23,6 +21,7 @@ export interface ChatExchange {
   userMessage: {
     text: string;
     timestamp: string;
+    quotedText?: string;
   };
   aiResponse: {
     text: string;
@@ -114,6 +113,18 @@ export default function Home() {
   const [loadingSeconds, setLoadingSeconds] = useState(0);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
+  // ChatGPT-style text selection & quoted context
+  const [quotedContext, setQuotedContext] = useState<string | null>(null);
+  const [selectionPrompt, setSelectionPrompt] = useState<{
+    text: string;
+    top: number;
+    left: number;
+  } | null>(null);
+
+  // Inline editing state for user messages
+  const [editingExchangeId, setEditingExchangeId] = useState<string | null>(null);
+  const [editingText, setEditingText] = useState("");
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -140,45 +151,128 @@ export default function Home() {
     return () => clearInterval(interval);
   }, [isLoading]);
 
-  // Handle form submission
-  const handleSubmit = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const trimmedQuestion = question.trim();
-    if (!trimmedQuestion || isLoading) return;
+  // Detect text selection on assistant responses to show floating "Ask Agent" action
+  useEffect(() => {
+    const handleSelectionChange = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) {
+        setSelectionPrompt(null);
+        return;
+      }
 
-    const exchangeId = `exchange-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    const timeString = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const text = selection.toString().trim();
+      if (!text) {
+        setSelectionPrompt(null);
+        return;
+      }
 
-    // New exchange with pending AI response
-    const newExchange: ChatExchange = {
-      id: exchangeId,
-      userMessage: {
-        text: trimmedQuestion,
-        timestamp: timeString,
-      },
-      aiResponse: null, // Loading indicator active for this exchange
+      // Ensure selection is strictly inside an assistant response (.ai-bubble)
+      const anchorNode = selection.anchorNode;
+      const focusNode = selection.focusNode;
+      const anchorEl = anchorNode instanceof Element ? anchorNode : anchorNode?.parentElement;
+      const focusEl = focusNode instanceof Element ? focusNode : focusNode?.parentElement;
+
+      const aiBubbleAnchor = anchorEl?.closest(".ai-bubble");
+      const aiBubbleFocus = focusEl?.closest(".ai-bubble");
+
+      // Only show if selection is within the same assistant bubble
+      if (!aiBubbleAnchor || aiBubbleAnchor !== aiBubbleFocus) {
+        setSelectionPrompt(null);
+        return;
+      }
+
+      try {
+        const range = selection.getRangeAt(0);
+        const rect = range.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) {
+          setSelectionPrompt(null);
+          return;
+        }
+
+        // Position floating pill above the selection centered horizontally
+        const top = Math.max(12, rect.top - 42);
+        const left = Math.min(
+          window.innerWidth - 130,
+          Math.max(12, rect.left + rect.width / 2 - 50)
+        );
+
+        setSelectionPrompt({ text, top, left });
+      } catch {
+        setSelectionPrompt(null);
+      }
     };
 
-    // Strictly enforce MAX_CONVERSATION_MESSAGES (5 user + 5 AI exchanges = 10 messages max)
-    // When the 6th question is added, remove the oldest user message + AI response
-    setExchanges((prev) => {
-      const trimmed =
-        prev.length >= MAX_CONVERSATION_MESSAGES
-          ? prev.slice(prev.length - MAX_CONVERSATION_MESSAGES + 1)
-          : prev;
-      return [...trimmed, newExchange];
-    });
+    const handleDismissFloating = () => {
+      setSelectionPrompt(null);
+    };
 
-    setQuestion("");
+    document.addEventListener("selectionchange", handleSelectionChange);
+    window.addEventListener("scroll", handleDismissFloating, true);
+    window.addEventListener("resize", handleDismissFloating);
+
+    return () => {
+      document.removeEventListener("selectionchange", handleSelectionChange);
+      window.removeEventListener("scroll", handleDismissFloating, true);
+      window.removeEventListener("resize", handleDismissFloating);
+    };
+  }, []);
+
+  // Reusable robust copy to clipboard with fallback (copies pure message content only)
+  const handleCopyMessage = async (id: string, textToCopy: string) => {
+    if (!textToCopy) return;
+    let copied = false;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(textToCopy);
+        copied = true;
+      }
+    } catch {
+      // Proceed to fallback
+    }
+
+    if (!copied) {
+      try {
+        const el = document.createElement("textarea");
+        el.value = textToCopy;
+        el.style.position = "fixed";
+        el.style.left = "-9999px";
+        el.style.top = "-9999px";
+        document.body.appendChild(el);
+        el.focus();
+        el.select();
+        copied = document.execCommand("copy");
+        document.body.removeChild(el);
+      } catch {
+        copied = false;
+      }
+    }
+
+    if (copied) {
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 2000);
+    }
+  };
+
+  // "Ask Agent" action: adds selected text as quote context and focuses input
+  const handleAskAgent = (selectedText: string) => {
+    setQuotedContext(selectedText);
+    setSelectionPrompt(null);
+    window.getSelection()?.removeAllRanges();
+    textareaRef.current?.focus();
+  };
+
+  // Reusable core request executor for new submissions and edits
+  const executeChatRequest = async (
+    messageToSend: string,
+    targetExchangeId: string,
+    activeConversationId: string | null
+  ) => {
     setIsLoading(true);
 
     try {
-      // Dispatch request with current conversation_id (null for first message, returned ID for subsequent messages)
-      const activeConversationId = conversationIdRef.current;
-      const res = await sendChatRequest(trimmedQuestion, activeConversationId);
+      const res = await sendChatRequest(messageToSend, activeConversationId);
       const { data, message } = await parseApiResponse(res);
 
-      // Store or update conversation_id whenever returned by the API
       if (data?.conversation_id && typeof data.conversation_id === "string") {
         updateConversationId(data.conversation_id);
       }
@@ -187,7 +281,6 @@ export default function Home() {
       let isError = false;
       let metadata: ResponseMetadata | null = null;
 
-      // Handle status codes while preserving existing error logic
       switch (res.status) {
         case 200: {
           responseContent = message;
@@ -200,28 +293,21 @@ export default function Home() {
           }
           break;
         }
-
         case 401: {
-          // 401: Render API returned error response without exposing API key
           responseContent = message || "Unauthorized: Invalid or missing API key.";
           isError = true;
           break;
         }
-
         case 429: {
-          // 429: Render API returned rate limit message
           responseContent = message || "Rate limit reached. Please try again later.";
           isError = true;
           break;
         }
-
         case 503: {
-          // 503: Service temporarily unavailable after retries
           responseContent = message || "Service temporarily unavailable. Please try again later.";
           isError = true;
           break;
         }
-
         default: {
           responseContent = message || `Request failed with status ${res.status}`;
           isError = true;
@@ -231,10 +317,9 @@ export default function Home() {
 
       const responseTime = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-      // Update the exchange with the received AI response
       setExchanges((prev) =>
         prev.map((item) =>
-          item.id === exchangeId
+          item.id === targetExchangeId
             ? {
                 ...item,
                 aiResponse: {
@@ -257,7 +342,7 @@ export default function Home() {
 
       setExchanges((prev) =>
         prev.map((item) =>
-          item.id === exchangeId
+          item.id === targetExchangeId
             ? {
                 ...item,
                 aiResponse: {
@@ -274,6 +359,80 @@ export default function Home() {
     }
   };
 
+  // Handle standard form submission
+  const handleSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion || isLoading) return;
+
+    const exchangeId = `exchange-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const timeString = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const activeQuoted = quotedContext;
+
+    const newExchange: ChatExchange = {
+      id: exchangeId,
+      userMessage: {
+        text: trimmedQuestion,
+        timestamp: timeString,
+        quotedText: activeQuoted || undefined,
+      },
+      aiResponse: null,
+    };
+
+    setExchanges((prev) => [...prev, newExchange]);
+
+    setQuestion("");
+    setQuotedContext(null);
+
+    const messageToSend = activeQuoted
+      ? `[Context: "${activeQuoted}"]\n${trimmedQuestion}`
+      : trimmedQuestion;
+
+    await executeChatRequest(messageToSend, exchangeId, conversationIdRef.current);
+  };
+
+  // Handle editing an existing user message
+  const handleEditSubmit = async (exchangeId: string) => {
+    const trimmed = editingText.trim();
+    if (!trimmed || isLoading) return;
+
+    const targetIndex = exchanges.findIndex((item) => item.id === exchangeId);
+    if (targetIndex === -1) return;
+
+    const targetExchange = exchanges[targetIndex];
+    const timeString = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const existingQuoted = targetExchange.userMessage.quotedText;
+
+    // Truncate subsequent exchanges following this turn to maintain conversation integrity
+    const priorExchanges = exchanges.slice(0, targetIndex);
+    const updatedExchange: ChatExchange = {
+      ...targetExchange,
+      userMessage: {
+        text: trimmed,
+        timestamp: timeString,
+        quotedText: existingQuoted,
+      },
+      aiResponse: null, // Loading indicator active
+    };
+
+    setExchanges([...priorExchanges, updatedExchange]);
+    setEditingExchangeId(null);
+
+    // Identify active conversation_id prior to this turn
+    const priorConversationId =
+      targetIndex > 0
+        ? priorExchanges[targetIndex - 1]?.aiResponse?.metadata?.conversationId || null
+        : null;
+
+    updateConversationId(priorConversationId);
+
+    const messageToSend = existingQuoted
+      ? `[Context: "${existingQuoted}"]\n${trimmed}`
+      : trimmed;
+
+    await executeChatRequest(messageToSend, exchangeId, priorConversationId);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -286,23 +445,17 @@ export default function Home() {
     textareaRef.current?.focus();
   };
 
-  // Reset conversation session & clear history and conversation_id
+  // Reset conversation session & clear history, context, and conversation_id
   const handleNewChat = () => {
     setExchanges([]);
     updateConversationId(null);
     setQuestion("");
+    setQuotedContext(null);
+    setEditingExchangeId(null);
+    setSelectionPrompt(null);
     textareaRef.current?.focus();
   };
 
-  const handleCopyMessage = async (id: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 2000);
-    } catch {
-      // Ignore clipboard write rejection
-    }
-  };
 
   return (
     <div className="chat-app-root">
@@ -326,9 +479,9 @@ export default function Home() {
         </div>
 
         <div className="header-controls">
-          <span className="exchange-counter-pill" title="Stored exchanges (5 user + 5 AI responses maximum)">
-            {exchanges.length} / {MAX_CONVERSATION_MESSAGES} exchanges
-          </span>
+          {/* <span className="exchange-counter-pill" title="Stored conversation exchanges">
+            {exchanges.length} {exchanges.length === 1 ? "exchange" : "exchanges"}
+          </span> */}
 
           <button
             type="button"
@@ -378,7 +531,7 @@ export default function Home() {
 
               <h1 className="hero-title">How can I help you today?</h1>
               <p className="hero-desc">
-                Engage in an AI-powered conversation on Technyx engineering, cloud platforms, and architecture. Context is maintained across up to {MAX_CONVERSATION_MESSAGES} exchanges.
+                Engage in an AI-powered conversation on Technyx engineering, cloud platforms, and architecture. Context is maintained across all conversation exchanges.
               </p>
 
               <div className="hero-prompt-grid">
@@ -415,10 +568,110 @@ export default function Home() {
               <div className="message-row user-row">
                 <div className="message-wrapper">
                   <div className="message-meta-header">
-                    <span className="message-sender-name">You</span>
+                    {/* Action Toolbar for User Message: Copy & Edit */}
+                    <div className="message-actions-group">
+                      <button
+                        type="button"
+                        className={`msg-action-btn ${copiedId === `user-${exchange.id}` ? "copied" : ""}`}
+                        onClick={() => handleCopyMessage(`user-${exchange.id}`, exchange.userMessage.text)}
+                        title="Copy message"
+                        aria-label="Copy message text"
+                      >
+                        {copiedId === `user-${exchange.id}` ? (
+                          <>
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                              <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                            <span>Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                              <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                            </svg>
+                            <span>Copy</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="msg-action-btn"
+                        onClick={() => {
+                          setEditingExchangeId(exchange.id);
+                          setEditingText(exchange.userMessage.text);
+                        }}
+                        disabled={isLoading}
+                        title="Edit message"
+                        aria-label="Edit user message"
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <path d="M12 20h9" />
+                          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                        </svg>
+                        <span>Edit</span>
+                      </button>
+                    </div>
+
                     <span>{exchange.userMessage.timestamp}</span>
+                    <span className="message-sender-name">You</span>
                   </div>
-                  <div className="user-bubble">{exchange.userMessage.text}</div>
+
+                  {/* Inline Message Edit View or Regular Bubble */}
+                  {editingExchangeId === exchange.id ? (
+                    <div className="edit-message-box">
+                      <textarea
+                        className="edit-message-textarea"
+                        value={editingText}
+                        maxLength={200}
+                        onChange={(e) => setEditingText(e.target.value.slice(0, 200))}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !e.shiftKey) {
+                            e.preventDefault();
+                            handleEditSubmit(exchange.id);
+                          } else if (e.key === "Escape") {
+                            setEditingExchangeId(null);
+                          }
+                        }}
+                        rows={2}
+                        autoFocus
+                        disabled={isLoading}
+                        aria-label="Edit your message"
+                      />
+                      <div className="edit-message-actions">
+                        <span className="edit-char-count">{editingText.length} / 200</span>
+                        <button
+                          type="button"
+                          className="edit-cancel-btn"
+                          onClick={() => setEditingExchangeId(null)}
+                          disabled={isLoading}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="edit-submit-btn"
+                          onClick={() => handleEditSubmit(exchange.id)}
+                          disabled={isLoading || !editingText.trim()}
+                        >
+                          Save &amp; Submit
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="user-bubble">
+                      {exchange.userMessage.quotedText && (
+                        <div className="user-bubble-quote" title={exchange.userMessage.quotedText}>
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                            <path d="M14.017 21v-7.391c0-5.704 3.731-9.57 8.983-10.609l.995 2.151c-2.432.917-3.995 3.638-3.995 5.849h4v10h-9.983zm-14.017 0v-7.391c0-5.704 3.748-9.57 9-10.609l.996 2.151c-2.433.917-3.996 3.638-3.996 5.849h3.983v10h-9.983z" />
+                          </svg>
+                          <span>{exchange.userMessage.quotedText}</span>
+                        </div>
+                      )}
+                      <span>{exchange.userMessage.text}</span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="message-avatar user-avatar" aria-hidden="true">
@@ -452,6 +705,36 @@ export default function Home() {
                     <span>
                       {exchange.aiResponse ? exchange.aiResponse.timestamp : "Responding..."}
                     </span>
+
+                    {/* Action Toolbar for Assistant Message: Copy */}
+                    {exchange.aiResponse && (
+                      <div className="message-actions-group">
+                        <button
+                          type="button"
+                          className={`msg-action-btn ${copiedId === `ai-${exchange.id}` ? "copied" : ""}`}
+                          onClick={() => handleCopyMessage(`ai-${exchange.id}`, exchange.aiResponse!.text)}
+                          title="Copy response"
+                          aria-label="Copy assistant response"
+                        >
+                          {copiedId === `ai-${exchange.id}` ? (
+                            <>
+                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                <polyline points="20 6 9 17 4 12" />
+                              </svg>
+                              <span>Copied</span>
+                            </>
+                          ) : (
+                            <>
+                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                              </svg>
+                              <span>Copy</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    )}
                   </div>
 
                   {/* AI Finished Response or In-Feed Typing Indicator */}
@@ -462,9 +745,6 @@ export default function Home() {
                       }`}
                     >
                       {exchange.aiResponse.text}
-
-                      {/* Bubble Footer: Latency/Fact metadata & copy button */}
-                      
                     </div>
                   ) : (
                     /* AI Modern Loading / Thinking State */
@@ -513,6 +793,40 @@ export default function Home() {
             </div>
           )}
 
+          {/* ChatGPT-Style Quoted Context Banner above Input */}
+          {quotedContext && (
+            <div className="quoted-context-dock" aria-label="Quoted text context">
+              <div className="quoted-context-preview">
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                  className="quoted-icon"
+                  aria-hidden="true"
+                >
+                  <path d="M14.017 21v-7.391c0-5.704 3.731-9.57 8.983-10.609l.995 2.151c-2.432.917-3.995 3.638-3.995 5.849h4v10h-9.983zm-14.017 0v-7.391c0-5.704 3.748-9.57 9-10.609l.996 2.151c-2.433.917-3.996 3.638-3.996 5.849h3.983v10h-9.983z" />
+                </svg>
+                <span className="quoted-context-label">Context:</span>
+                <span className="quoted-context-snippet" title={quotedContext}>
+                  &ldquo;{quotedContext.length > 85 ? quotedContext.slice(0, 85) + "..." : quotedContext}&rdquo;
+                </span>
+              </div>
+              <button
+                type="button"
+                className="quoted-context-clear-btn"
+                onClick={() => setQuotedContext(null)}
+                title="Remove quoted context"
+                aria-label="Remove quoted context"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+          )}
+
           {/* Chat Input Box */}
           <form className="chat-input-box" onSubmit={handleSubmit}>
             <div className="chat-input-row">
@@ -520,7 +834,7 @@ export default function Home() {
                 id="question-input"
                 ref={textareaRef}
                 className="question-textarea"
-                placeholder="Ask Technyx Assistant anything..."
+                placeholder={quotedContext ? "Ask a question about the selected text..." : "Ask Technyx Assistant anything..."}
                 value={question}
                 maxLength={200}
                 onChange={(e) => setQuestion(e.target.value.slice(0, 200))}
@@ -566,6 +880,28 @@ export default function Home() {
           </div>
         </div>
       </footer>
+
+      {/* Floating "Ask Agent" Action on Text Selection */}
+      {selectionPrompt && (
+        <button
+          type="button"
+          className="ask-agent-floating-btn"
+          style={{
+            top: `${selectionPrompt.top}px`,
+            left: `${selectionPrompt.left}px`,
+          }}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => handleAskAgent(selectionPrompt.text)}
+          title="Ask Agent about selected text"
+          aria-label="Ask Agent about selected text"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 2L14.4 9.6L22 12L14.4 14.4L12 22L9.6 14.4L2 12L9.6 9.6L12 2Z" />
+          </svg>
+          <span>Ask Agent</span>
+        </button>
+      )}
     </div>
   );
 }
+
